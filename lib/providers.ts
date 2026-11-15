@@ -393,14 +393,26 @@ export async function probeProvider(envUrl: string, provider: ProviderEntry, tim
   const url = provider.wire === 'gemini' ? `${base}/v1beta/models` : `${base}/v1/models`;
   const headers: Record<string, string> = { accept: 'application/json', ...authHeaders(provider.auth, provider.key) };
   if (provider.wire === 'anthropic') headers['anthropic-version'] = '2023-06-01';
-  try {
-    const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
-    if (!res.ok) return { provider, ok: false, status: res.status, models: [], error: `GET ${url} answered HTTP ${res.status}` };
-    const body: unknown = await res.json();
-    return { provider, ok: true, status: res.status, models: modelsFromBody(provider.wire, body), error: null };
-  } catch (err) {
-    return { provider, ok: false, status: 0, models: [], error: `GET ${url} failed: ${(err as Error).message}` };
+  // One retry: a single transient failure (a 5xx, a timeout, a reset connection)
+  // used to drop the whole provider from the catalog and lose its models for
+  // the trial. The retry is a fixed second attempt, never a timed backoff, so
+  // the probe stays deterministic; when the first attempt answers, the result
+  // is exactly what it was before.
+  let last: Probe | null = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
+      if (!res.ok) {
+        last = { provider, ok: false, status: res.status, models: [], error: `GET ${url} answered HTTP ${res.status}` };
+        continue;
+      }
+      const body: unknown = await res.json();
+      return { provider, ok: true, status: res.status, models: modelsFromBody(provider.wire, body), error: null };
+    } catch (err) {
+      last = { provider, ok: false, status: 0, models: [], error: `GET ${url} failed: ${(err as Error).message}` };
+    }
   }
+  return last ?? { provider, ok: false, status: 0, models: [], error: `GET ${url} failed` };
 }
 
 const byModelId = (a: ListedModel, b: ListedModel): number => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
